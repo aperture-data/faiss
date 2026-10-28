@@ -39,7 +39,9 @@ cmake --install build
 Consumers use `find_package(faiss CONFIG REQUIRED)` and link `faiss_lmdb`.
 Applications implementing their own `Storage` need only `faiss_transactional`.
 LMDB is not required when `FAISS_ENABLE_LMDB=OFF`. The installed package discovers
-its exported dependencies. CI checks static/shared builds, runtime SIMD dispatch,
+its exported dependencies. Rebuild consumers when upgrading the transactional
+API; its new optional storage methods and statistics change the binary interface.
+CI checks static/shared builds, runtime SIMD dispatch,
 AddressSanitizer/UndefinedBehaviorSanitizer, and a relocated installed consumer.
 
 ## Transaction ownership and atomic mutations
@@ -272,9 +274,10 @@ abort contract remains the transaction owner's responsibility.
 ## Validation and rollout
 
 `validate()` performs an administrative full scan of vectors, counts, degrees,
-IDs, cross-level edges, packed tombstone consistency and entry-point consistency. It does not require graph
-connectivity. Run it during migration verification or offline diagnosis, not
-before every query.
+IDs, cross-level edges, packed tombstone consistency and entry-point consistency.
+It also checks referenced packed blocks have exactly the population recorded by
+metadata. It does not require graph connectivity. Run it during migration
+verification or offline diagnosis, not before every query.
 
 The tests cover commit/reopen, application-write rollback, old-reader snapshots,
 failed updates, map-full savepoint recovery, callback failure/reentry, changelog

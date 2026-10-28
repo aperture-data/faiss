@@ -1,0 +1,91 @@
+{
+  "feature_commit": "73e531960e980fb2e32d453831d39b70657edf09",
+  "parent_commit": "316297b53a2a352f52833deaa2ea76c0f7acb01f",
+  "cpu": "11th Gen Intel(R) Core(TM) i7-11850H @ 2.50GHz",
+  "architecture": "x86_64",
+  "compiler": "GCC (Ubuntu 15.2.0-16ubuntu1) 15.2.0",
+  "container": "aperturedata/aperturedb-developer:ci_develop-amd64",
+  "extension_flags": "-O3 -DNDEBUG; no LTO",
+  "threads": 1,
+  "generic_faiss_compile_options": "OPTIMIZE",
+  "dd_faiss_compile_options": "OPTIMIZE DD AVX2 AVX512 AVX512_VPOPCNT",
+  "dd_runtime_simd": "AVX512_VPOPCNT",
+  "notes": [
+    "Each JSON compares identical workloads and distance kernels within that process.",
+    "Transactional build cases independently construct LMDB and native graphs and report each measured recall.",
+    "native-materialized cases copy exactly the native topology into LMDB in bounded batches inside one parent transaction, then fully validate it. These are query-only fixtures; materialization times are not transactional construction performance.",
+    "All queries run on warm data in one read snapshot with operation-local caches, one thread, 200 queries, 16 warmups, seed 12345.",
+    "Common efSearch 64 is not a matched-recall comparison when algorithms or topology differ. ACORN includes 10 predicate-matching seeds.",
+    "The benchmark does not measure cold storage, customer embedding distributions, concurrent writers/readers, long-term tombstone accumulation, or peak process memory.",
+    "All 90 regression tests passed Release and ASAN/UBSAN, and relocated static/shared package consumers passed. Local sanitizers cover extension, storage, and tests; upstream core is prebuilt.",
+    "After timing binaries were frozen, the final commit added administrative-only validate_storage block-count checks and two regressions. Query and construction paths are unchanged; the working-tree hashes identify files at recording time, not necessarily generic compiled inputs; executable hashes below identify the retained timed binaries. Final remote CI passed all 92 tests including full-core sanitizers.",
+    "The 18 measured cases comprise 16 base cases at efSearch 64 plus two DD same-topology 1% ACORN fixtures at ef512 and 1024. At ef1024 the filtered comparator recalls are 1.0 and 0.9975; reported latency ratio remains approximately 3.28."
+  ],
+  "final_validated_commit": "df147a72fddeafce7b5c5938e8b846a34d3a85d8",
+  "final_ci": {
+    "url": "https://github.com/aperture-data/faiss/actions/runs/40617243736",
+    "result": "success",
+    "jobs": [
+      "static generic",
+      "shared DD",
+      "fully sanitized",
+      "core without LMDB"
+    ],
+    "tests": 92,
+    "verification": "GitHub Actions job logs: 92 tests and installed consumer passed in each LMDB configuration."
+  },
+  "result_count": 18,
+  "result_sha256": {
+    "dd-100k-128-native-fixture.json": "9de337c165ce62f3dd539594ecbda52c9b76c68294f623b7c5a305e6343bd93b",
+    "dd-100k-768-native-fixture.json": "76916cfc17448326c1505aecd6852fcfc5f61c73ed42fd50ca73a0d73ad93d9f",
+    "dd-10k-128-acorn1pct-ef1024-native-fixture.json": "5b4a4e113409a59756fa16635d2507620418a69f59b02a84dbe5de342bf7a9ac",
+    "dd-10k-128-acorn1pct-ef512-native-fixture.json": "78dd8225dcfb5a2a3264c98b38007a6780539a62a7f64e8262f5e0d0c3dd61cc",
+    "dd-128-acorn1pct.json": "331f58245e2ff96cbe3794956b782ec1b4776396f289cf62f56e4da929823e21",
+    "dd-128-churn10.json": "f60a84dbad1db13ea2cdc2239e89dcc0f20711ad9c3eec5468be79a3fcf61ac8",
+    "dd-128-exact1pct.json": "12589dffeb642fcffb81b8fb22d7e8d56b7fa0aa614d93981a36436d9c263365",
+    "dd-128.json": "7c4219994cd2201507dc7a8f7d320b4f2174b1d4ebd199378d98961ffe57ee85",
+    "dd-768-churn10.json": "b3192a9f476ed800bb251b7366319accdc12f80ff5a8bd3b184d75e08c976c31",
+    "dd-768.json": "39a1056fa1387cab81d30aeea2c250c51dbccfc78e7cfd115bf9926071d1c63a",
+    "generic-100k-128-native-fixture.json": "7e085df2665b22b21eecee98c90ad3b8cb996e40ebc37b2aa5a858082355251c",
+    "generic-100k-768-native-fixture.json": "1238c8ffdaf3ffcbe5a5e960d2ef3e7b4dff3eab5d572cc53c49b1eaa193d3db",
+    "generic-128-acorn1pct.json": "d0cb66805ab2abf8823c6095c14c3fc92eac2da96248691d041c0ee775e71831",
+    "generic-128-churn10.json": "f63a66dfcd7f8e295181c4b1f670a456f9eb4b7de412551f4bfb7ea614867e71",
+    "generic-128-exact1pct.json": "331183ef3d6797c926a1d4ed4ba2888d426a26a635c1e44f2b923b845e210279",
+    "generic-128.json": "2b28a00d396a4ce1cd63e5c6544a51f27764b0033e1fdce2e7a80d40f4ac3b0b",
+    "generic-768-churn10.json": "e911842d28436ea5e1a1b6c8f7e38d760bd30c5f4c260eea997b8d916ef78724",
+    "generic-768.json": "dc748f3198cda97decf644363689f6e42f802274469626e3f19db99baa181eb7"
+  },
+  "working_tree_source_sha256_at_recording": {
+    "faiss/transactional/HNSW.cpp": "6a7efdf5e0f867a9828ce7dc1bde86daa405b2f2cf83e4048cfc9070d9d0fce0",
+    "faiss/transactional/HNSW.h": "3ca7b5f6f3205491ee7de224ca493b5525101c6fa2f5a5bcb373a1feb57e933b",
+    "faiss/transactional/FastSearchScratch.h": "9e5ba69bfd504a03a87218050a6e689baa0b9e139d18a2e56a79eace0cf0d138",
+    "faiss/transactional/LmdbStorage.cpp": "b30ba5da2328391390c28f6986c3c4a9e11cf28f99a05dbe04b51203e9159ee0",
+    "faiss/transactional/LmdbStorage.h": "7aa7b795f9dcb76d0d9d8dcef10d0fe47f90fcd2ae4bb8ffa8bf1e5d9a8859d7",
+    "faiss/transactional/benchmark.cpp": "8ff6a2e288b4dd66b9fb5f09af38672589881398911238037f07b0136946b2ac"
+  },
+  "dd_frozen_snapshot_source_sha256": {
+    "faiss/transactional/HNSW.cpp": "89c4c42dc28420e7b395401e2981133ad892d9b13f8714b64df7673ec2ff6e31",
+    "faiss/transactional/HNSW.h": "0a4511880636b11e7df2bd5a1ece6b1fdc2e465f93b7305bc40cd4a368373502",
+    "faiss/transactional/FastSearchScratch.h": "9e5ba69bfd504a03a87218050a6e689baa0b9e139d18a2e56a79eace0cf0d138",
+    "faiss/transactional/LmdbStorage.cpp": "b30ba5da2328391390c28f6986c3c4a9e11cf28f99a05dbe04b51203e9159ee0",
+    "faiss/transactional/LmdbStorage.h": "7aa7b795f9dcb76d0d9d8dcef10d0fe47f90fcd2ae4bb8ffa8bf1e5d9a8859d7",
+    "faiss/transactional/benchmark.cpp": "8ff6a2e288b4dd66b9fb5f09af38672589881398911238037f07b0136946b2ac"
+  },
+  "timed_executables": {
+    "generic": {
+      "sha256": "6a3357174d0cfb318e5b05bfe97263b5f14277e82d6919830f1962d1e11d90d1",
+      "path": "/tmp/faiss-production-build/faiss/transactional/faiss_transactional_benchmark",
+      "bytes": 9542888,
+      "mtime_utc": "2026-10-28T01:42:12.075016+00:00",
+      "mtime_precedes_first_completed_result": true
+    },
+    "dd": {
+      "sha256": "8fd6f0be7d6af707bdabdb551b28c17227d28e84c89bd923007d5a9da1484d5e",
+      "path": "/tmp/faiss-packed-dd/build/benchmark",
+      "bytes": 18418296,
+      "mtime_utc": "2026-10-28T01:41:47.341534+00:00",
+      "mtime_precedes_first_completed_result": true
+    }
+  },
+  "source_provenance": "Generic compiled directly from the shared working tree; the working-tree source hashes were captured later and may include in-flight administrative-validation edits, so they are not asserted to be the generic executable inputs. DD compiled from the retained immutable snapshot listed separately. The executable hashes identify both retained binaries used throughout their respective timed cases; neither was rebuilt after timings started. Later published source edits affected administrative validation only, without query/construction behavior changes."
+}
