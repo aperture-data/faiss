@@ -4,6 +4,11 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+include(CMakeFindDependencyMacro)
+# Static FAISS exports a link dependency on this imported target. Consumers
+# should not have to discover private dependencies before find_package(faiss).
+find_dependency(OpenMP COMPONENTS CXX)
+
 if(@FAISS_ENABLE_LMDB@)
   include("${CMAKE_CURRENT_LIST_DIR}/FindFaissLMDB.cmake")
 endif()

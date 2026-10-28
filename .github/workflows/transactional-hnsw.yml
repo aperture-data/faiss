@@ -5,28 +5,86 @@ on:
   pull_request:
     paths:
       - 'faiss/transactional/**'
+      - 'faiss/impl/HNSW.*'
+      - 'faiss/CMakeLists.txt'
+      - 'cmake/**'
       - 'CMakeLists.txt'
       - '.github/workflows/transactional-hnsw.yml'
 permissions:
   contents: read
 jobs:
   lmdb:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: static-generic
+            shared: 'OFF'
+            opt: generic
+            sanitize: ''
+          - name: shared-dd
+            shared: 'ON'
+            opt: dd
+            sanitize: ''
+          - name: sanitized
+            shared: 'OFF'
+            opt: generic
+            sanitize: '-fsanitize=address,undefined -fno-omit-frame-pointer'
+    name: ${{ matrix.name }}
     runs-on: ubuntu-24.04
+    env:
+      OMP_NUM_THREADS: '1'
+      OPENBLAS_NUM_THREADS: '1'
+      ASAN_OPTIONS: detect_leaks=1
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y ninja-build libopenblas-dev liblmdb-dev libgtest-dev
       - name: Configure
         run: >-
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DBUILD_SHARED_LIBS=${{ matrix.shared }} -DFAISS_OPT_LEVEL=${{ matrix.opt }}
           -DFAISS_ENABLE_GPU=OFF -DFAISS_ENABLE_PYTHON=OFF
           -DFAISS_ENABLE_EXTRAS=OFF -DFAISS_ENABLE_MKL=OFF -DBUILD_TESTING=OFF
           -DFAISS_ENABLE_TRANSACTIONAL_HNSW=ON -DFAISS_ENABLE_LMDB=ON
-          -DFAISS_TRANSACTIONAL_TESTING=ON
+          -DFAISS_TRANSACTIONAL_TESTING=ON -DFAISS_TRANSACTIONAL_BENCHMARK=ON
+          -DCMAKE_CXX_FLAGS="${{ matrix.sanitize }}"
+          -DCMAKE_EXE_LINKER_FLAGS="${{ matrix.sanitize }}"
       - name: Build
-        run: cmake --build build --target faiss_transactional_test -j 2
+        run: cmake --build build --target faiss_transactional_test faiss_transactional_benchmark -j 2
       - name: Test
-        env:
-          OMP_NUM_THREADS: '1'
-          OPENBLAS_NUM_THREADS: '1'
-        run: ctest --test-dir build --output-on-failure
+        run: ctest --test-dir build --output-on-failure --timeout 120
+      - name: Install and consume relocated package
+        run: |
+          cmake --install build --prefix "$RUNNER_TEMP/faiss-install"
+          mv "$RUNNER_TEMP/faiss-install" "$RUNNER_TEMP/faiss-relocated"
+          cmake -S faiss/transactional/consumer -B consumer-build -G Ninja \
+            -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/faiss-relocated" \
+            -DCMAKE_CXX_FLAGS="${{ matrix.sanitize }}" \
+            -DCMAKE_EXE_LINKER_FLAGS="${{ matrix.sanitize }}"
+          cmake --build consumer-build
+          ctest --test-dir consumer-build --output-on-failure
+      - name: Benchmark smoke and machine-readable output
+        run: |
+          build/faiss/transactional/faiss_transactional_benchmark \
+            --n 300 --d 24 --queries 20 --batch 50 --ef 64 \
+            --selectivity 0.25 --churn 0.2 > benchmark.json
+          python3 -c 'import json; d=json.load(open("benchmark.json")); assert d["lmdb"]["recall_at_k"] >= 0.9; assert d["native"]["query_count"] == 20'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-${{ matrix.name }}
+          path: benchmark.json
+  core-without-lmdb:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install core dependencies only
+        run: sudo apt-get update && sudo apt-get install -y ninja-build libopenblas-dev
+      - name: Configure and build without LMDB
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DFAISS_ENABLE_GPU=OFF -DFAISS_ENABLE_PYTHON=OFF \
+            -DFAISS_ENABLE_EXTRAS=OFF -DFAISS_ENABLE_MKL=OFF -DBUILD_TESTING=OFF \
+            -DFAISS_ENABLE_TRANSACTIONAL_HNSW=ON -DFAISS_ENABLE_LMDB=OFF
+          cmake --build build --target faiss_transactional -j 2
