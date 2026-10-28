@@ -1,0 +1,32 @@
+name: Transactional HNSW
+on:
+  push:
+    branches: ['aperture/**']
+  pull_request:
+    paths:
+      - 'faiss/transactional/**'
+      - 'CMakeLists.txt'
+      - '.github/workflows/transactional-hnsw.yml'
+permissions:
+  contents: read
+jobs:
+  lmdb:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y ninja-build libopenblas-dev liblmdb-dev libgtest-dev
+      - name: Configure
+        run: >-
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DFAISS_ENABLE_GPU=OFF -DFAISS_ENABLE_PYTHON=OFF
+          -DFAISS_ENABLE_EXTRAS=OFF -DFAISS_ENABLE_MKL=OFF -DBUILD_TESTING=OFF
+          -DFAISS_ENABLE_TRANSACTIONAL_HNSW=ON -DFAISS_ENABLE_LMDB=ON
+          -DFAISS_TRANSACTIONAL_TESTING=ON
+      - name: Build
+        run: cmake --build build --target faiss_transactional_test -j 2
+      - name: Test
+        env:
+          OMP_NUM_THREADS: '1'
+          OPENBLAS_NUM_THREADS: '1'
+        run: ctest --test-dir build --output-on-failure

@@ -829,7 +829,7 @@ write_basic_package_version_file(
 
 configure_file(${PROJECT_SOURCE_DIR}/cmake/faiss-config.cmake.in
   ${PROJECT_BINARY_DIR}/cmake/faiss-config.cmake
-  COPYONLY
+  @ONLY
 )
 install(FILES ${PROJECT_BINARY_DIR}/cmake/faiss-config.cmake
   ${PROJECT_BINARY_DIR}/cmake/faiss-config-version.cmake

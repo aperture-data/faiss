@@ -4,4 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+if(@FAISS_ENABLE_LMDB@)
+  include("${CMAKE_CURRENT_LIST_DIR}/FindFaissLMDB.cmake")
+endif()
 include("${CMAKE_CURRENT_LIST_DIR}/faiss-targets.cmake")

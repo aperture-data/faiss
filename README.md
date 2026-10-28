@@ -1,3 +1,8 @@
+> **Aperture Data fork** — based on FAISS v1.15.1. This branch adds an
+> opt-in [transaction-scoped HNSW engine and LMDB adapter](faiss/transactional/README.md).
+> Existing FAISS index APIs remain available. The new backend is experimental;
+> application integration and production performance qualification are separate.
+
 # Faiss
 
 Faiss is a library for efficient similarity search and clustering of dense vectors. It contains algorithms that search in sets of vectors of any size, up to ones that possibly do not fit in RAM. It also contains supporting code for evaluation and parameter tuning. Faiss is written in C++ with complete wrappers for Python/numpy. Some of the most useful algorithms are implemented on the GPU. It is developed primarily at Meta's [Fundamental AI Research](https://ai.facebook.com/) group.
