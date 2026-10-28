@@ -38,8 +38,9 @@ struct Options {
     size_t n = 10000, dimensions = 128, queries = 200, k = 10;
     size_t batch = 128, ef = 64, m = 32, ef_construction = 200, repeats = 1;
     size_t warmup = 16, seed = 12345, map_mib = 0;
-    size_t max_visits = 0, cache_mib = 8;
-    std::string mode = "ann";
+    size_t max_visits = 0, cache_mib = 8, vectors_per_block = 0;
+    std::string mode = "ann", layout = "records";
+    std::string build_mode = "transactional";
     double selectivity = 1, churn = 0;
     std::string metric = "l2";
 };
@@ -71,6 +72,10 @@ Options parse(int argc, char** argv) {
                        "  --metric l2|ip|cosine --selectivity 1 --churn 0\n"
                        "  --repeats 1 --warmup 16 --map-mib 0 (0=estimated)\n"
                        "  --mode ann|acorn|exact --max-visits 0 --cache-mib 8\n"
+                       "  --layout records|packed --vectors-per-block 0 (0=automatic)\n"
+                       "  --build transactional|native-materialized\n"
+                       "Native-materialized copies the native graph for query-only comparisons;\n"
+                       "its materialization time is not transactional HNSW insertion time.\n"
                        "Churn replaces a fraction of initial vectors before queries.\n"
                        "Both engines retain old nodes as excluded traversal bridges.\n"
                        "Search measurements use one read snapshot, with warmup.\n";
@@ -81,6 +86,10 @@ Options parse(int argc, char** argv) {
         const std::string value = argv[i];
         if (arg == "--mode")
             o.mode = value;
+        else if (arg == "--build")
+            o.build_mode = value;
+        else if (arg == "--layout")
+            o.layout = value;
         else if (arg == "--metric")
             o.metric = value;
         else if (arg == "--selectivity")
@@ -117,6 +126,8 @@ Options parse(int argc, char** argv) {
                 o.max_visits = n;
             else if (arg == "--cache-mib")
                 o.cache_mib = n;
+            else if (arg == "--vectors-per-block")
+                o.vectors_per_block = n;
             else
                 throw std::invalid_argument("unknown argument: " + arg);
         }
@@ -125,7 +136,10 @@ Options parse(int argc, char** argv) {
         o.dimensions > (1u << 20) || !o.queries || !o.k || o.k > o.n ||
         !o.batch || !o.ef || o.ef > (1u << 24) || o.m < 2 || o.m > 4096 ||
         o.ef_construction < o.m || o.ef_construction > (1u << 24) ||
-        !o.repeats ||
+        !o.repeats || o.vectors_per_block > 4096 ||
+        (o.layout != "records" && o.layout != "packed") ||
+        (o.build_mode != "transactional" &&
+         o.build_mode != "native-materialized") ||
         (o.metric != "l2" && o.metric != "ip" && o.metric != "cosine") ||
         (o.mode != "ann" && o.mode != "acorn" && o.mode != "exact"))
         throw std::invalid_argument(
@@ -292,7 +306,15 @@ void run(const Options& o) {
     {
         Transaction tx(db.env, false);
         {
-            ft::LmdbStorage storage(tx.txn, db.table, 1);
+            ft::LmdbStorage storage(
+                    tx.txn,
+                    db.table,
+                    1,
+                    0,
+                    {},
+                    ft::LmdbStorage::WriteMode::Automatic,
+                    {o.layout == "packed",
+                     static_cast<uint32_t>(o.vectors_per_block)});
             ft::HNSW index(storage);
             ft::Config config;
             config.dimensions = o.dimensions;
@@ -305,7 +327,7 @@ void run(const Options& o) {
         tx.commit();
     }
     double lmdb_insert_ms = 0, native_insert_ms = 0, commit_ms = 0;
-    double max_writer_ms = 0;
+    double max_writer_ms = 0, materialize_ms = 0, fixture_validation_ms = 0;
     size_t transactions = 0;
     const auto build_range = [&](size_t first, size_t end, bool churn) {
         for (size_t offset = first; offset < end; offset += o.batch) {
@@ -313,10 +335,20 @@ void run(const Options& o) {
             auto start = Clock::now();
             native.add(count, vectors.data() + offset * o.dimensions);
             native_insert_ms += milliseconds(start);
+            if (o.build_mode == "native-materialized")
+                continue;
             const auto writer_start = Clock::now();
             Transaction tx(db.env, false);
             {
-                ft::LmdbStorage storage(tx.txn, db.table, 1);
+                ft::LmdbStorage storage(
+                        tx.txn,
+                        db.table,
+                        1,
+                        0,
+                        {},
+                        ft::LmdbStorage::WriteMode::Automatic,
+                        {o.layout == "packed",
+                         static_cast<uint32_t>(o.vectors_per_block)});
                 ft::HNSW index(storage);
                 start = Clock::now();
                 if (churn) {
@@ -333,6 +365,71 @@ void run(const Options& o) {
     };
     build_range(0, o.n, false);
     build_range(o.n, total, true);
+    if (o.build_mode == "native-materialized") {
+        // This fixture measures search on exactly the same topology as native.
+        // Buffer only --batch records at once, and publish the completed graph
+        // in one parent transaction. It is not a transactional ingestion test.
+        const auto writer_start = Clock::now();
+        Transaction tx(db.env, false);
+        {
+            ft::LmdbStorage storage(tx.txn, db.table, 1);
+            ft::HNSW index(storage);
+            auto metadata = index.metadata();
+            metadata.next_id = total;
+            metadata.live_count = o.n;
+            metadata.entry_point = native.hnsw.entry_point;
+            metadata.max_level = native.hnsw.max_level;
+            const auto start = Clock::now();
+            for (size_t offset = 0; offset < total; offset += o.batch) {
+                ft::WriteBatch batch;
+                batch.metadata = metadata;
+                const auto end = std::min(total, offset + o.batch);
+                // Storage allocates packed live bits alongside contiguous IDs.
+                // The unfinished prefix stays private to this transaction.
+                batch.metadata.next_id = end;
+                batch.metadata.live_count = end - std::min(end, replaced);
+                if (end != total) {
+                    batch.metadata.entry_point = 0;
+                    batch.metadata.max_level = native.hnsw.levels[0] - 1;
+                }
+                for (size_t id = offset; id < end; ++id) {
+                    ft::Node node;
+                    node.deleted = id < replaced;
+                    node.links.resize(native.hnsw.levels[id]);
+                    for (size_t level = 0; level < node.links.size(); ++level) {
+                        size_t begin, finish;
+                        native.hnsw.neighbor_range(id, level, &begin, &finish);
+                        for (size_t edge = begin; edge < finish; ++edge) {
+                            const auto neighbor = native.hnsw.neighbors[edge];
+                            if (neighbor == -1)
+                                break;
+                            if (neighbor < 0 || size_t(neighbor) >= total)
+                                throw std::runtime_error(
+                                        "invalid native fixture edge");
+                            node.links[level].push_back(neighbor);
+                        }
+                    }
+                    batch.nodes.emplace(
+                            static_cast<ft::NodeId>(id), std::move(node));
+                    batch.vectors.emplace(
+                            static_cast<ft::NodeId>(id),
+                            std::vector<float>(
+                                    vectors.data() + id * o.dimensions,
+                                    vectors.data() + (id + 1) * o.dimensions));
+                }
+                storage.apply(batch);
+            }
+            materialize_ms = milliseconds(start);
+            const auto validate_start = Clock::now();
+            const auto report = index.validate();
+            fixture_validation_ms = milliseconds(validate_start);
+            if (report.nodes != total || report.live_nodes != o.n)
+                throw std::runtime_error("invalid materialized fixture counts");
+        }
+        commit_ms = tx.commit();
+        max_writer_ms = milliseconds(writer_start);
+        transactions = 1;
+    }
     check(mdb_env_sync(db.env, 1));
     const auto file_bytes = std::filesystem::file_size(db.path + "/data.mdb");
     MDB_envinfo info{};
@@ -419,6 +516,8 @@ void run(const Options& o) {
                 work.expanded += stats.expanded;
                 work.node_reads += stats.node_reads;
                 work.vector_reads += stats.vector_reads;
+                work.vector_block_reads += stats.vector_block_reads;
+                work.live_block_reads += stats.live_block_reads;
                 limited_queries += stats.visit_limit_reached;
                 std::vector<faiss::idx_t> ids;
                 ids.reserve(found.size());
@@ -457,6 +556,11 @@ void run(const Options& o) {
               << ",\"ef_search\":" << o.ef << ",\"max_visits\":" << o.max_visits
               << ",\"cache_mib\":" << o.cache_mib << ",\"lmdb_mode\":\""
               << o.mode << "\""
+              << ",\"layout\":\"" << o.layout << "\""
+              << ",\"requested_vectors_per_block\":" << o.vectors_per_block
+              << ",\"build_mode\":\"" << o.build_mode << "\""
+              << ",\"same_topology\":"
+              << (o.build_mode == "native-materialized" ? "true" : "false")
               << ",\"seed\":" << o.seed << ",\"metric\":\"" << o.metric
               << "\",\"selectivity\":" << o.selectivity
               << ",\"allowed\":" << allowed.size() << ",\"churn\":" << o.churn
@@ -466,6 +570,8 @@ void run(const Options& o) {
               << "  \"build\":{\"lmdb_insert_and_erase_ms\":" << lmdb_insert_ms
               << ",\"lmdb_commit_ms\":" << commit_ms
               << ",\"native_insert_ms\":" << native_insert_ms
+              << ",\"fixture_materialize_ms\":" << materialize_ms
+              << ",\"fixture_validation_ms\":" << fixture_validation_ms
               << ",\"transactions\":" << transactions
               << ",\"max_writer_ms\":" << max_writer_ms
               << ",\"lmdb_file_bytes\":" << file_bytes
@@ -483,6 +589,10 @@ void run(const Options& o) {
               << double(work.node_reads) / lmdb_summary.latency.size()
               << ",\"mean_vector_reads\":"
               << double(work.vector_reads) / lmdb_summary.latency.size()
+              << ",\"mean_vector_block_reads\":"
+              << double(work.vector_block_reads) / lmdb_summary.latency.size()
+              << ",\"mean_live_block_reads\":"
+              << double(work.live_block_reads) / lmdb_summary.latency.size()
               << ",\"budget_limited_queries\":" << limited_queries << "}\n}\n";
 }
 } // namespace

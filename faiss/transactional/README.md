@@ -59,7 +59,10 @@ namespace th = faiss::transactional;
 
 // txn is a caller-owned write transaction; table is an ordinary byte-key DBI.
 {
-    th::LmdbStorage storage(txn, table, index_id, generation);
+    th::LmdbStorage storage(
+            txn, table, index_id, generation, {},
+            th::LmdbStorage::WriteMode::Automatic,
+            th::LmdbStorage::PackedVectors{true}); // recommended for new indexes
     th::HNSW index(storage);
     th::Config config;
     config.dimensions = dimensions;
@@ -76,9 +79,16 @@ namespace th = faiss::transactional;
 
 The same API reads a caller-owned read transaction. Entry point, vectors, edges,
 and tombstones all come from that snapshot, even if a writer commits concurrently.
-No borrowed LMDB value pointers escape the public adapter API. Read methods
-decode directly from the mapped record into owned results before returning;
-operation-local caches never survive the operation or transaction.
+The `node()` and `vector()` record readers return owned values. For packed
+indexes, `query_distance_computer()` returns an operation-scoped computer that
+borrows mapped vector blocks and tombstone bitmaps. The computer, adapter and
+transaction must remain alive for that operation, and **no writes may occur in
+that transaction while a computer exists**, including writes through another
+adapter or raw LMDB. Writers in other transactions remain safe under LMDB MVCC.
+The normal `HNSW::search()` call creates and destroys its computer internally.
+No operation-local cache survives the query or transaction. Mutating through
+the same adapter invalidates older computers; external transaction lifetime and
+mutations remain the caller's responsibility.
 
 `add`, `update`, and `erase` prepare all changes before writing. Input errors,
 cancellation, traversal limits and workspace limits during preparation leave
@@ -156,13 +166,24 @@ limit can truncate even exact mode; inspect `visit_limit_reached`. Exact search
 is a deliberate full scan, useful for ground truth or small filtered sets, and
 is not an automatic fallback hidden inside ANN search.
 
-Search statistics expose distance evaluations, node/vector storage reads,
-adjacency expansions (including two-hop bridges), and budget exhaustion.
-`cache_bytes` bounds owned decoded-record caches; search does not retain decoded
-vectors because query distances are computed once. Distance/visited bookkeeping
-is proportional to the visit limit, separately from the cache allowance. ACORN
-also inspects bounded-degree bridge adjacency. Exact scanning uses bounded
-cache and result memory rather than memory proportional to index cardinality.
+Search statistics expose distance evaluations, logical vector accesses, node
+reads, adjacency expansions (including two-hop bridges), and budget exhaustion.
+For packed indexes, `vector_block_reads` and `live_block_reads` count actual
+block lookups on directory misses; many distance calculations reuse each block.
+`cache_bytes` reserves three quarters for owned decoded nodes and one quarter
+for the backend's mapped-pointer directories. It does not bound LMDB's page
+cache or process RSS. Search does not retain decoded vector payloads.
+Distance/visited bookkeeping is bounded separately: small snapshots use indexed
+scratch up to a fixed 131,072-ID ceiling; larger ones use compact sparse tables
+proportional to actual traversal work. ACORN also tracks rejected bridges.
+Exact scans use bounded cache and result memory without a visited-distance table.
+
+Packed queries use batch-of-four FAISS distance kernels and a bounded native
+FAISS candidate heap. Result filtering uses a transactional tombstone bitmap,
+with no adjacency read solely to determine whether a candidate is deleted.
+The generic `Storage` interface remains supported with owned record access;
+custom backends can optionally provide a query distance computer and implement
+`QueryLiveAccess`. Both must describe exactly the caller's transaction snapshot.
 
 Cancellation callbacks are polled throughout traversal and mutation preparation
 and throw `SearchCancelled`. Selector and cancellation callbacks must not mutate
@@ -190,13 +211,49 @@ and measure writer occupancy alongside search latency.
 
 ## Record format and replication
 
-One table stores keys prefixed by `TH01`, a 64-bit index ID and a 64-bit generation.
-Metadata (`m`), node (`n` plus local ID), and vector (`v` plus local ID) records
-are separate. Node records contain all levels; changing links does not rewrite
-the vector. Integers and IEEE-754 float bits are big-endian. Metadata includes
-format version 1. Checked decoders reject malformed sizes, invalid numeric
-values, invalid/duplicate neighbor IDs, and excessive degrees/levels. Use a new
-namespace/generation for incompatible formats.
+One ordinary LMDB table stores keys prefixed by `TH01`, a big-endian 64-bit
+index ID and a big-endian 64-bit generation. The next byte identifies the
+record kind; records other than metadata append a big-endian 32-bit local or
+block ID. Formats are versioned in metadata and detected on reopening. Existing
+v1 namespaces remain readable and writable; constructor settings never silently
+convert them. To use packed storage for an existing index, rebuild or import
+into a new generation and switch it transactionally at the application layer.
+
+`PackedVectors{true}` selects **format v2** for a new namespace. This is the
+recommended layout for latency-sensitive workloads:
+
+| Record | Encoding and update behavior |
+| --- | --- |
+| Metadata (`m`) | 56 bytes: the v1 metadata fields with version 2, followed by a big-endian 32-bit vectors-per-block width. |
+| Vectors (`b`) | A 16-byte big-endian `PV02` header (magic, dimensions, populated count, width), followed by little-endian IEEE-754 floats. Each touched block is rewritten once per batch. |
+| Nodes (`n`) | The existing big-endian per-node encoding with all adjacency levels and a tombstone. Edge changes do not rewrite vectors. |
+| Tombstones (`l`) | 528 bytes: a 16-byte big-endian `LV02` header (magic, populated count, width 4096, reserved zero) and 512 bytes of bits. Bit 1 means deleted; bits use least-significant-bit-first order within each byte. Unallocated bits are zero. |
+
+Automatic vector width is a power of two targeting at most approximately
+256 KiB per full block, with at least one and at most 4096 vectors. Explicit
+widths from 1 through 4096 are supported. A single vector can exceed the target
+at high dimensionality. Blocks are padded to at least 4096 bytes and capped at
+64 MiB; incompatible dimension/width choices are rejected.
+On aligned little-endian mappings, distance kernels read the mapped floats
+directly. Other alignment or byte order uses checked scratch decoding. Pointer
+directories are operation-local and bounded; a cache miss does an LMDB lookup.
+The direct directory path avoids hashing when all block pointers fit.
+
+Packed writes pay copy-on-write amplification for the touched vector block,
+trading write throughput and replication volume for query latency. Append in
+batches where possible. Deletes change a node, bitmap and metadata, with **no
+vector-block rewrite**. Adjacency-only changes skip unchanged bitmap records.
+All records, including bitmaps, participate in the same savepoint/parent
+transaction and changelog contract. Administrative validation checks bitmap and
+node tombstones agree.
+
+The default constructor retains **format v1** for compatibility. It stores
+52-byte metadata, big-endian per-node records, and one big-endian float-vector
+record per `v` key. Its per-vector decoding/lookup query cost is substantially
+higher; explicitly select packed v2 for new latency-sensitive indexes. Checked
+decoders reject malformed sizes, invalid numeric values, invalid/duplicate
+neighbor IDs and excessive degrees/levels. Query reads check the records they
+touch; `validate()` provides a full administrative scan.
 
 `LmdbStorage::Put` integrates with a database changelog. It receives the existing
 transaction, DBI, and temporary encoded key/value views. The callback must apply
@@ -215,7 +272,7 @@ abort contract remains the transaction owner's responsibility.
 ## Validation and rollout
 
 `validate()` performs an administrative full scan of vectors, counts, degrees,
-IDs, cross-level edges and entry-point consistency. It does not require graph
+IDs, cross-level edges, packed tombstone consistency and entry-point consistency. It does not require graph
 connectivity. Run it during migration verification or offline diagnosis, not
 before every query.
 
@@ -233,14 +290,17 @@ For example:
 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
   build/faiss/transactional/faiss_transactional_benchmark \
   --n 10000 --d 128 --queries 200 --ef 128 --batch 100 \
-  --selectivity 0.01 --mode acorn > benchmark.json
+  --layout packed --selectivity 0.01 --mode exact > benchmark.json
 ```
 
 Benchmark real cardinalities, dimensions, metrics, selectivity, churn, warm/cold
 cache, concurrent readers and writer contention before rollout. The included
 benchmark measures warm-cache queries in one process; native FAISS is a separate
-in-memory topology and is a reference, not a transactional substitute. See
-[BENCHMARKS.md](BENCHMARKS.md) for the measured development baseline.
+in-memory topology and is a reference, not a transactional substitute.
+`--build native-materialized` instead imports the native graph as a query-only
+fixture, separating traversal/storage effects from topology; its materialization
+time is not transactional HNSW ingestion throughput. See
+[BENCHMARKS.md](BENCHMARKS.md) for measurements and reproduction commands.
 
 Athena still needs transaction-scoped routing, entity/local-ID mappings,
 normalization rules, changelog integration, predicate/seed translation,

@@ -4,6 +4,7 @@
  * HNSW traversal adapted from faiss/impl/HNSW.cpp.
  * Licensed under the MIT license in the root LICENSE file.
  */
+#include <faiss/transactional/FastSearchScratch.h>
 #include <faiss/transactional/HNSW.h>
 
 #include <algorithm>
@@ -18,6 +19,7 @@
 
 #include <faiss/impl/DistanceComputer.h>
 #include <faiss/impl/HNSW.h>
+#include <faiss/impl/hnsw/MinimaxHeap.h>
 #include <faiss/utils/distances.h>
 
 namespace faiss::transactional {
@@ -51,7 +53,6 @@ void validate_node(const Node& node, NodeId id, const Metadata& meta) {
         node.links.size() > 33) {
         throw std::runtime_error("Corrupt HNSW node identity or level");
     }
-    std::vector<NodeId> sorted;
     for (size_t level = 0; level < node.links.size(); ++level) {
         const auto& links = node.links[level];
         const size_t capacity = level ? meta.config.M : 2 * meta.config.M;
@@ -63,9 +64,7 @@ void validate_node(const Node& node, NodeId id, const Metadata& meta) {
                 throw std::runtime_error("Corrupt HNSW adjacency ID");
             }
         }
-        sorted.assign(links.begin(), links.end());
-        std::sort(sorted.begin(), sorted.end());
-        if (std::adjacent_find(sorted.begin(), sorted.end()) != sorted.end()) {
+        if (!detail::unique_nonnegative_ids(links)) {
             throw std::runtime_error("Duplicate HNSW adjacency ID");
         }
     }
@@ -212,19 +211,105 @@ struct Overlay {
     }
 };
 
+// Small snapshots benefit from indexed scratch. The fixed ceiling avoids an
+// O(index size) allocation for large indexes; those retain compact sparse
+// tables. Scratch stores no database pointers and never survives a query.
+constexpr size_t dense_scratch_limit = 128u << 10;
+class DistanceMemo {
+    detail::IdDistanceMap sparse_;
+    std::vector<float> distances_;
+    std::vector<uint8_t> present_;
+
+   public:
+    void enable_dense(uint64_t count) {
+        if (count && count <= dense_scratch_limit) {
+            distances_.resize(count);
+            present_.resize(count);
+        }
+    }
+    const float* find(NodeId id) const {
+        if (present_.empty())
+            return sparse_.find(id);
+        if (id < 0 || size_t(id) >= present_.size())
+            throw std::runtime_error("Invalid HNSW scratch ID");
+        return present_[id] ? &distances_[id] : nullptr;
+    }
+    void insert(NodeId id, float value) {
+        if (present_.empty()) {
+            sparse_.insert(id, value);
+        } else {
+            if (id < 0 || size_t(id) >= present_.size())
+                throw std::runtime_error("Invalid HNSW scratch ID");
+            present_[id] = 1;
+            distances_[id] = value;
+        }
+    }
+    void clear() {
+        sparse_.clear();
+        std::fill(present_.begin(), present_.end(), 0);
+    }
+};
+class QueryVisited {
+    detail::IdSet sparse_;
+    std::vector<uint8_t> present_;
+
+   public:
+    QueryVisited(uint64_t count, bool query) {
+        if (query && count && count <= dense_scratch_limit)
+            present_.resize(count);
+    }
+    bool insert(NodeId id) {
+        if (present_.empty())
+            return sparse_.insert(id);
+        if (id < 0 || size_t(id) >= present_.size())
+            throw std::runtime_error("Invalid HNSW visited ID");
+        return !std::exchange(present_[id], 1);
+    }
+};
+
+struct ResultCollector {
+    Overlay& store;
+    const IDSelector* selector;
+    const QueryLiveAccess* live;
+    size_t k;
+    std::priority_queue<Candidate> results;
+
+    bool deleted(NodeId id) const {
+        if (store.batch.metadata.live_count == store.batch.metadata.next_id)
+            return false;
+        return live ? live->deleted(id) : store.node(id)->deleted;
+    }
+    bool accepts(NodeId id) const {
+        return (!selector || selector->is_member(id)) && !deleted(id);
+    }
+    void observe(NodeId id, float value) {
+        // Avoid even a predicate or tombstone lookup for a candidate that
+        // cannot improve the current top-k result set.
+        const Candidate candidate{value, id};
+        if (results.size() == k && candidate >= results.top())
+            return;
+        if (!accepts(id))
+            return;
+        results.push(candidate);
+        if (results.size() > k)
+            results.pop();
+    }
+};
+
 struct VisitLimit {};
 struct Distance : faiss::DistanceComputer {
     Overlay& store;
     const Config& config;
     Cache<std::vector<float>> cache;
     const float* query = nullptr;
-    std::unordered_map<NodeId, float> measured;
+    DistanceMemo measured;
     size_t visit_limit = std::numeric_limits<size_t>::max();
     size_t evaluations = 0;
     bool memoize = true;
     bool cache_vectors = true;
+    std::unique_ptr<faiss::DistanceComputer> query_backend;
     SearchStats* stats = nullptr;
-    std::function<void(NodeId, float)> observe;
+    ResultCollector* collector = nullptr;
     Distance(Overlay& s, size_t bytes)
             : store(s),
               config(s.batch.metadata.config),
@@ -260,6 +345,8 @@ struct Distance : faiss::DistanceComputer {
     }
     void set_query(const float* x) override {
         query = x;
+        if (query_backend)
+            query_backend->set_query(x);
         measured.clear();
         evaluations = 0;
     }
@@ -269,14 +356,17 @@ struct Distance : faiss::DistanceComputer {
             throw std::runtime_error("Invalid HNSW query node ID");
         const auto id = static_cast<NodeId>(raw_id);
         if (memoize) {
-            auto it = measured.find(id);
-            if (it != measured.end())
-                return it->second;
+            if (const auto* value = measured.find(id))
+                return *value;
         }
         if (evaluations >= visit_limit)
             throw VisitLimit{};
         float result;
-        if (cache_vectors) {
+        if (query_backend) {
+            result = (*query_backend)(id);
+            if (stats)
+                ++stats->vector_reads;
+        } else if (cache_vectors) {
             auto value = get(id);
             result = compare(query, value->data());
         } else {
@@ -288,14 +378,55 @@ struct Distance : faiss::DistanceComputer {
                 throw std::runtime_error("Corrupt HNSW vector dimension");
             result = compare(query, value.data());
         }
+        return record(id, result);
+    }
+    float record(NodeId id, float result) {
+        if (!std::isfinite(result))
+            throw std::runtime_error("Non-finite HNSW distance");
         if (memoize)
-            measured.emplace(id, result);
+            measured.insert(id, result);
         ++evaluations;
         if (stats)
             ++stats->visited;
-        if (observe)
-            observe(id, result);
+        if (collector)
+            collector->observe(id, result);
         return result;
+    }
+    void distances_batch_4(
+            idx_t a,
+            idx_t b,
+            idx_t c,
+            idx_t d,
+            float& da,
+            float& db,
+            float& dc,
+            float& dd) override {
+        cancelled(store.cancel);
+        // The generic path preserves cached-distance and partial-budget
+        // semantics. Fast backends can evaluate four new candidates together.
+        if (!query_backend || evaluations > visit_limit ||
+            visit_limit - evaluations < 4 || a == b || a == c || a == d ||
+            b == c || b == d || c == d) {
+            faiss::DistanceComputer::distances_batch_4(
+                    a, b, c, d, da, db, dc, dd);
+            return;
+        }
+        for (auto id : {a, b, c, d}) {
+            if (id < 0 || uint64_t(id) >= store.batch.metadata.next_id)
+                throw std::runtime_error("Invalid HNSW query node ID");
+            if (memoize && measured.find(static_cast<NodeId>(id))) {
+                faiss::DistanceComputer::distances_batch_4(
+                        a, b, c, d, da, db, dc, dd);
+                return;
+            }
+        }
+        query_backend->distances_batch_4(a, b, c, d, da, db, dc, dd);
+        if (stats)
+            stats->vector_reads += 4;
+        record(static_cast<NodeId>(a), da);
+        record(static_cast<NodeId>(b), db);
+        record(static_cast<NodeId>(c), dc);
+        record(static_cast<NodeId>(d), dd);
     }
     float symmetric_dis(idx_t a, idx_t b) override {
         auto x = get(a);
@@ -321,20 +452,40 @@ Candidate greedy(Overlay& s, Distance& d, Candidate best, int level) {
             throw std::runtime_error("Corrupt HNSW node level");
         if (s.stats)
             ++s.stats->expanded;
-        for (auto id : node->links[level]) {
-            Candidate next{d(id), id};
+        const auto& links = node->links[level];
+        auto consider = [&](NodeId id, float value) {
+            Candidate next{value, id};
             if (next < best) {
                 best = next;
                 changed = true;
             }
+        };
+        size_t i = 0;
+        for (; i + 4 <= links.size(); i += 4) {
+            float da, db, dc, dd;
+            d.distances_batch_4(
+                    links[i],
+                    links[i + 1],
+                    links[i + 2],
+                    links[i + 3],
+                    da,
+                    db,
+                    dc,
+                    dd);
+            consider(links[i], da);
+            consider(links[i + 1], db);
+            consider(links[i + 2], dc);
+            consider(links[i + 3], dd);
         }
+        for (; i < links.size(); ++i)
+            consider(links[i], d(links[i]));
     } while (changed);
     return best;
 }
 
 // Search routing has an ef-sized heap independent of the result filter. A
 // restrictive predicate must never force filling ef accepted results by
-// scanning the entire graph. Results are collected by Distance::observe
+// scanning the entire graph. Results are collected by ResultCollector
 // instead.
 std::vector<Candidate> search_layer(
         Overlay& s,
@@ -349,9 +500,17 @@ std::vector<Candidate> search_layer(
             std::greater<Candidate>>
             frontier;
     std::priority_queue<Candidate> best;
-    std::unordered_set<NodeId> visited;
-    std::unordered_set<NodeId> expanded_bridges;
+    QueryVisited visited(s.batch.metadata.next_id, options != nullptr);
+    QueryVisited expanded_bridges(
+            s.batch.metadata.next_id, options && options->acorn);
+    std::optional<faiss::MinimaxHeapT<>> bounded;
+    if (options && ef <= size_t(std::numeric_limits<int>::max()))
+        bounded.emplace(static_cast<int>(ef));
     auto offer = [&](Candidate c) {
+        if (bounded) {
+            bounded->push(c.second, c.first);
+            return;
+        }
         if (best.size() < ef || c < best.top()) {
             frontier.push(c);
             best.push(c);
@@ -360,37 +519,38 @@ std::vector<Candidate> search_layer(
         }
     };
     for (const auto& entry : entries)
-        if (visited.insert(entry.second).second)
+        if (visited.insert(entry.second))
             offer(entry);
-    while (!frontier.empty()) {
+    while (bounded ? bounded->size() != 0 : !frontier.empty()) {
         cancelled(s.cancel);
-        const auto current = frontier.top();
-        if (best.size() >= ef && current > best.top())
-            break;
-        frontier.pop();
+        Candidate current;
+        if (bounded) {
+            current.second = bounded->pop_min(&current.first);
+            if (bounded->count_below(current.first) >= static_cast<int>(ef))
+                break;
+        } else {
+            current = frontier.top();
+            if (best.size() >= ef && current > best.top())
+                break;
+            frontier.pop();
+        }
         auto node = s.node(current.second);
         if (level >= int(node->links.size()))
             throw std::runtime_error("Corrupt HNSW adjacency level");
         if (s.stats)
             ++s.stats->expanded;
         auto consider = [&](NodeId id) {
-            if (visited.insert(id).second)
+            if (visited.insert(id))
                 offer({d(id), id});
         };
         if (options && options->acorn && level == 0) {
-            const bool all_live =
-                    s.batch.metadata.live_count == s.batch.metadata.next_id;
             const auto accepted = [&](NodeId id) {
-                // Evaluate a selective predicate before decoding a node just
-                // to check its tombstone. In a tombstone-free snapshot no
-                // node lookup is needed to accept a matching candidate.
-                return options->selector->is_member(id) &&
-                        (all_live || !s.node(id)->deleted);
+                return d.collector->accepts(id);
             };
             for (auto id : node->links[0]) {
                 if (accepted(id)) {
                     consider(id);
-                } else if (expanded_bridges.insert(id).second) {
+                } else if (expanded_bridges.insert(id)) {
                     // Expand each rejected bridge once per level search.
                     // Repeating it cannot add candidates: its accepted
                     // neighbors have already been considered.
@@ -404,8 +564,32 @@ std::vector<Candidate> search_layer(
                 }
             }
         } else {
-            for (auto id : node->links[level])
-                consider(id);
+            NodeId pending[4];
+            size_t count = 0;
+            for (auto id : node->links[level]) {
+                if (!visited.insert(id))
+                    continue;
+                pending[count++] = id;
+                if (count == 4) {
+                    float da, db, dc, dd;
+                    d.distances_batch_4(
+                            pending[0],
+                            pending[1],
+                            pending[2],
+                            pending[3],
+                            da,
+                            db,
+                            dc,
+                            dd);
+                    offer({da, pending[0]});
+                    offer({db, pending[1]});
+                    offer({dc, pending[2]});
+                    offer({dd, pending[3]});
+                    count = 0;
+                }
+            }
+            for (size_t i = 0; i < count; ++i)
+                offer({d(pending[i]), pending[i]});
         }
     }
     std::vector<Candidate> result;
@@ -693,36 +877,37 @@ std::vector<Result> HNSW::search(
     const size_t ef =
             std::min<uint64_t>(std::max(k, options.ef_search), meta.next_id);
     Overlay view(
-            storage_, meta, 0, options.cache_bytes, options.cancelled, stats);
+            storage_,
+            meta,
+            0,
+            options.cache_bytes - options.cache_bytes / 4,
+            options.cancelled,
+            stats);
     Distance distance(view, 0);
     distance.cache_vectors = false;
+    distance.query_backend = storage_.query_distance_computer(
+            meta, options.cache_bytes / 4, stats);
     distance.memoize = !options.exact;
     distance.stats = stats;
     distance.visit_limit = options.max_visits
             ? options.max_visits
             : (options.exact ? size_t(meta.next_id) : budget(meta, ef));
     distance.set_query(query);
-    std::priority_queue<Candidate> results;
-    distance.observe = [&](NodeId id, float value) {
-        if (options.selector && !options.selector->is_member(id))
-            return;
-        if (meta.live_count != meta.next_id && view.node(id)->deleted)
-            return;
-        Candidate candidate{value, id};
-        if (results.size() < k || candidate < results.top()) {
-            results.push(candidate);
-            if (results.size() > k)
-                results.pop();
-        }
-    };
+    if (!options.exact)
+        distance.measured.enable_dense(meta.next_id);
+    ResultCollector collector{
+            view,
+            options.selector,
+            dynamic_cast<const QueryLiveAccess*>(distance.query_backend.get()),
+            k,
+            {}};
+    distance.collector = &collector;
     try {
         if (options.exact) {
             for (uint64_t id = 0; id < meta.next_id; ++id) {
                 cancelled(options.cancelled);
                 auto nid = static_cast<NodeId>(id);
-                if ((!options.selector || options.selector->is_member(nid)) &&
-                    (meta.live_count == meta.next_id ||
-                     !view.node(nid)->deleted))
+                if (collector.accepts(nid))
                     distance(nid);
             }
         } else {
@@ -741,9 +926,9 @@ std::vector<Result> HNSW::search(
         stats->visit_limit_reached = true;
     }
     std::vector<Result> result;
-    while (!results.empty()) {
-        const auto [value, id] = results.top();
-        results.pop();
+    while (!collector.results.empty()) {
+        const auto [value, id] = collector.results.top();
+        collector.results.pop();
         result.push_back(
                 {id, meta.config.metric == METRIC_L2 ? value : -value});
     }
@@ -754,11 +939,17 @@ ValidationReport HNSW::validate(const std::function<bool()>& cancel) const {
     cancelled(cancel);
     const auto meta = metadata();
     Overlay view(storage_, meta, 0, 8u << 20, cancel);
+    const auto query_backend =
+            storage_.query_distance_computer(meta, 1u << 20, nullptr);
+    const auto* live =
+            dynamic_cast<const QueryLiveAccess*>(query_backend.get());
     ValidationReport report;
     int highest = -1;
     for (uint64_t id = 0; id < meta.next_id; ++id) {
         cancelled(cancel);
         auto node = view.node(static_cast<NodeId>(id));
+        if (live && live->deleted(static_cast<NodeId>(id)) != node->deleted)
+            throw std::runtime_error("Corrupt HNSW tombstone bitmap");
         ++report.nodes;
         report.live_nodes += !node->deleted;
         highest = std::max(highest, int(node->links.size()) - 1);

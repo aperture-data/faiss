@@ -25,7 +25,14 @@ int main() {
         MDB_dbi table;
         check(mdb_dbi_open(txn, nullptr, 0, &table));
         {
-            faiss::transactional::LmdbStorage storage(txn, table, 1);
+            faiss::transactional::LmdbStorage storage(
+                    txn,
+                    table,
+                    1,
+                    0,
+                    {},
+                    faiss::transactional::LmdbStorage::WriteMode::Automatic,
+                    {true, 4});
             faiss::transactional::HNSW index(storage);
             faiss::transactional::Config config;
             config.dimensions = 2;
@@ -40,6 +47,19 @@ int main() {
         MDB_txn* completed = txn;
         txn = nullptr;
         check(mdb_txn_commit(completed));
+        check(mdb_txn_begin(env, nullptr, MDB_RDONLY, &txn));
+        {
+            // Reopening must autodetect the persisted packed layout.
+            faiss::transactional::LmdbStorage storage(txn, table, 1);
+            faiss::transactional::HNSW index(storage);
+            const float query[] = {1, 1};
+            faiss::transactional::SearchStats stats;
+            const auto found = index.search(query, 1, {}, &stats);
+            if (found.size() != 1 || found[0].id != 1 ||
+                stats.vector_block_reads == 0) {
+                throw std::runtime_error("incorrect packed reopen result");
+            }
+        }
         result = 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

@@ -67,14 +67,37 @@ jobs:
           ctest --test-dir consumer-build --output-on-failure
       - name: Benchmark smoke and machine-readable output
         run: |
+          for layout in records packed; do
+            build/faiss/transactional/faiss_transactional_benchmark \
+              --n 300 --d 24 --queries 20 --batch 50 --ef 64 \
+              --selectivity 0.25 --churn 0.2 --layout "$layout" > "benchmark-$layout.json"
+          done
           build/faiss/transactional/faiss_transactional_benchmark \
             --n 300 --d 24 --queries 20 --batch 50 --ef 64 \
-            --selectivity 0.25 --churn 0.2 > benchmark.json
-          python3 -c 'import json; d=json.load(open("benchmark.json")); assert d["lmdb"]["recall_at_k"] >= 0.9; assert d["native"]["query_count"] == 20'
+            --selectivity 0.25 --churn 0.2 --layout packed \
+            --build native-materialized > benchmark-fixture.json
+          python3 - <<'PYTHON'
+          import json
+          for layout in ("records", "packed"):
+              with open(f"benchmark-{layout}.json") as stream:
+                  result = json.load(stream)
+              assert result["lmdb"]["recall_at_k"] >= 0.9
+              assert result["native"]["query_count"] == 20
+              assert result["workload"]["layout"] == layout
+              if layout == "packed":
+                  assert result["lmdb_search_work"]["mean_vector_block_reads"] > 0
+          with open("benchmark-fixture.json") as stream:
+              fixture = json.load(stream)
+          assert fixture["workload"]["same_topology"]
+          assert fixture["build"]["lmdb_insert_and_erase_ms"] == 0
+          assert fixture["build"]["fixture_materialize_ms"] > 0
+          assert fixture["lmdb"]["recall_at_k"] >= 0.9
+          assert fixture["lmdb_search_work"]["mean_live_block_reads"] > 0
+          PYTHON
       - uses: actions/upload-artifact@v4
         with:
           name: benchmark-${{ matrix.name }}
-          path: benchmark.json
+          path: benchmark-*.json
   core-without-lmdb:
     runs-on: ubuntu-24.04
     steps:

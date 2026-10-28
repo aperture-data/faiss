@@ -43,7 +43,8 @@ if(FAISS_TRANSACTIONAL_TESTING)
   find_package(GTest CONFIG REQUIRED)
   find_package(Threads REQUIRED)
   add_executable(faiss_transactional_test
-    tests.cpp hnsw_edge_tests.cpp storage_edge_tests.cpp)
+    tests.cpp hnsw_edge_tests.cpp storage_edge_tests.cpp
+    fast_search_scratch_tests.cpp packed_storage_tests.cpp)
   target_link_libraries(faiss_transactional_test PRIVATE
     faiss_lmdb GTest::gtest_main Threads::Threads)
   include(GoogleTest)

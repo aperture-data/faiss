@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <memory>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -18,6 +19,7 @@
 #include <vector>
 
 #include <faiss/MetricType.h>
+#include <faiss/impl/DistanceComputer.h>
 #include <faiss/impl/IDSelector.h>
 
 namespace faiss::transactional {
@@ -68,6 +70,16 @@ class SearchCancelled : public std::runtime_error {
     SearchCancelled() : std::runtime_error("HNSW operation cancelled") {}
 };
 
+struct SearchStats;
+
+// Optional fast tombstone access implemented by a query distance computer.
+// It shares the computer's snapshot and operation-scoped lifetime. Invalid or
+// missing IDs must throw; the answer must agree with Storage::node(id).
+struct QueryLiveAccess {
+    virtual ~QueryLiveAccess() = default;
+    virtual bool deleted(NodeId id) const = 0;
+};
+
 /** One caller-owned transaction including pending writes. Implementations must
  * reject further access after invalidate(). Instances and all their views must
  * be destroyed before the caller ends the transaction. No concurrent access.
@@ -77,6 +89,16 @@ struct Storage {
     virtual std::optional<Metadata> metadata() const = 0;
     virtual Node node(NodeId id) const = 0;
     virtual std::vector<float> vector(NodeId id) const = 0;
+    // Optional operation-scoped fast query access. Distances are ascending:
+    // squared L2 or NEGATIVE inner product. No writes, callback reentry, or
+    // transaction end may occur while the computer exists. A null result uses
+    // the owned vector() fallback. Borrowed backend data never outlives it.
+    virtual std::unique_ptr<faiss::DistanceComputer> query_distance_computer(
+            const Metadata&,
+            size_t /*cache_bytes*/,
+            SearchStats*) const {
+        return nullptr;
+    }
     virtual void put_metadata(const Metadata& value) = 0;
     virtual void put_node(NodeId id, const Node& value) = 0;
     virtual void put_vector(NodeId id, const std::vector<float>& value) = 0;
@@ -98,6 +120,8 @@ struct SearchStats {
     size_t expanded = 0; // adjacency lists expanded (including upper levels)
     size_t vector_reads = 0;
     size_t node_reads = 0;
+    size_t vector_block_reads = 0; // packed backend cache misses
+    size_t live_block_reads = 0;   // packed tombstone cache misses
     bool visit_limit_reached = false;
 };
 struct SearchOptions {
@@ -106,8 +130,9 @@ struct SearchOptions {
     // In exact mode zero scans all IDs. Nonzero is a hard limit on unique query
     // distance evaluations, including upper-level routing and supplied seeds.
     size_t max_visits = 0;
-    // Owned node-cache allowance; search does not retain decoded vectors.
-    // Distance/visited bookkeeping is bounded by max_visits separately.
+    // Cache allowance: 3/4 for owned nodes, 1/4 for optional backend views.
+    // Search does not retain decoded vectors. Distance/visited bookkeeping
+    // is bounded separately by the visit budget or a fixed small-index cap.
     size_t cache_bytes = 8u << 20;
     // Predicates and cancellation callbacks must not mutate the transaction
     // or reenter the index. Their referenced state must outlive this call.

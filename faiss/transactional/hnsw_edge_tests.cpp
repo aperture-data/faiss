@@ -21,6 +21,95 @@ struct CountingStorage final : ft::Storage {
     mutable std::map<ft::NodeId, size_t> vector_reads_by_id;
     size_t writes = 0;
     bool invalidated = false;
+    bool fast_queries = false;
+    bool fast_live_queries = false;
+    std::map<ft::NodeId, bool> fast_live_overrides;
+    mutable size_t fast_live_reads = 0;
+    mutable std::map<ft::NodeId, size_t> fast_live_reads_by_id;
+    ft::NodeId nonfinite_fast_id = ft::no_node;
+    mutable size_t fast_factory_calls = 0, fast_scalar_calls = 0,
+                   fast_batch_calls = 0;
+    mutable std::map<ft::NodeId, size_t> fast_evaluations;
+    std::function<void()> after_fast_batch;
+
+    std::unique_ptr<faiss::DistanceComputer> query_distance_computer(
+            const ft::Metadata& metadata,
+            size_t,
+            ft::SearchStats*) const override {
+        if (!fast_queries)
+            return nullptr;
+        ++fast_factory_calls;
+        struct Computer : faiss::DistanceComputer {
+            const CountingStorage& storage;
+            ft::Config config;
+            const float* query = nullptr;
+            Computer(const CountingStorage& storage, const ft::Config& config)
+                    : storage(storage), config(config) {}
+            void set_query(const float* value) override {
+                query = value;
+            }
+            float evaluate(faiss::idx_t raw) {
+                storage.check();
+                const auto id = static_cast<ft::NodeId>(raw);
+                ++storage.fast_evaluations[id];
+                if (id == storage.nonfinite_fast_id)
+                    return std::numeric_limits<float>::quiet_NaN();
+                const auto& vector = storage.vectors.at(id);
+                float result = 0;
+                for (size_t dim = 0; dim < config.dimensions; ++dim) {
+                    if (config.metric == faiss::METRIC_L2) {
+                        const float delta = query[dim] - vector[dim];
+                        result += delta * delta;
+                    } else {
+                        result -= query[dim] * vector[dim];
+                    }
+                }
+                return result;
+            }
+            float operator()(faiss::idx_t id) override {
+                ++storage.fast_scalar_calls;
+                return evaluate(id);
+            }
+            void distances_batch_4(
+                    faiss::idx_t a,
+                    faiss::idx_t b,
+                    faiss::idx_t c,
+                    faiss::idx_t d,
+                    float& da,
+                    float& db,
+                    float& dc,
+                    float& dd) override {
+                ++storage.fast_batch_calls;
+                da = evaluate(a);
+                db = evaluate(b);
+                dc = evaluate(c);
+                dd = evaluate(d);
+                if (storage.after_fast_batch)
+                    storage.after_fast_batch();
+            }
+            float symmetric_dis(faiss::idx_t, faiss::idx_t) override {
+                throw std::logic_error("query backend used for construction");
+            }
+        };
+        struct LiveComputer final : Computer, ft::QueryLiveAccess {
+            using Computer::Computer;
+            bool deleted(ft::NodeId id) const override {
+                this->storage.check();
+                if (id < 0 || uint64_t(id) >= this->storage.meta->next_id)
+                    throw std::runtime_error("invalid test live lookup ID");
+                ++this->storage.fast_live_reads;
+                ++this->storage.fast_live_reads_by_id[id];
+                const auto overridden =
+                        this->storage.fast_live_overrides.find(id);
+                if (overridden != this->storage.fast_live_overrides.end())
+                    return overridden->second;
+                return this->storage.nodes.at(id).deleted;
+            }
+        };
+        if (fast_live_queries)
+            return std::make_unique<LiveComputer>(*this, metadata.config);
+        return std::make_unique<Computer>(*this, metadata.config);
+    }
 
     void check() const {
         if (invalidated)
@@ -89,6 +178,17 @@ CountingStorage chain(int n) {
         storage.nodes[id] = std::move(node);
         storage.vectors[id] = {static_cast<float>(id)};
     }
+    return storage;
+}
+
+CountingStorage star() {
+    auto storage = chain(9);
+    storage.nodes[0].links[0].clear();
+    for (ft::NodeId id = 1; id < 9; ++id) {
+        storage.nodes[0].links[0].push_back(id);
+        storage.nodes[id].links[0] = {0};
+    }
+    storage.fast_queries = true;
     return storage;
 }
 
@@ -506,7 +606,8 @@ TEST(TransactionalHNSWEdge, FullValidationChecksCountsEdgesAndTombstones) {
     EXPECT_THROW(index.validate(), std::runtime_error);
 }
 
-TEST(TransactionalHNSWEdge, FullValidationRejectsDuplicateAndOversizedAdjacency) {
+TEST(TransactionalHNSWEdge,
+     FullValidationRejectsDuplicateAndOversizedAdjacency) {
     auto storage = chain(32);
     ft::HNSW index(storage);
     storage.nodes[0].links[0] = {1, 1};
@@ -579,7 +680,8 @@ TEST(TransactionalHNSWEdge, CancellationDuringBatchPreparationDoesNotPublish) {
     EXPECT_TRUE(storage.vectors.empty());
 }
 
-TEST(TransactionalHNSWEdge, ConstructionVisitLimitNeverPublishesPartialTopology) {
+TEST(TransactionalHNSWEdge,
+     ConstructionVisitLimitNeverPublishesPartialTopology) {
     auto storage = chain(4);
     ft::HNSW index(storage);
     ft::MutationOptions options;
@@ -609,7 +711,8 @@ TEST(TransactionalHNSWEdge, AcornExpandsEachDeletedBridgeOnce) {
     options.acorn = true;
     options.selector = &selected;
     options.max_visits = 3;
-    options.cache_bytes = 1; // Exercise owned views even without retained nodes.
+    options.cache_bytes =
+            1; // Exercise owned views even without retained nodes.
     ft::SearchStats stats;
     const float query = 4;
     const auto found = index.search(&query, 3, options, &stats);
@@ -623,5 +726,253 @@ TEST(TransactionalHNSWEdge, AcornExpandsEachDeletedBridgeOnce) {
     EXPECT_EQ(stats.expanded, 5);
     EXPECT_EQ(storage.vector_reads_by_id[1], 0);
     EXPECT_EQ(storage.vector_reads_by_id[3], 0);
+}
+
+TEST(TransactionalHNSWEdge, FastBackendBatchesAndMemoizesAcrossLevels) {
+    auto storage = star();
+    storage.meta->max_level = 1;
+    for (auto& [id, node] : storage.nodes)
+        node.links.push_back(node.links[0]);
+    ft::HNSW index(storage);
+    const float query = -1;
+    ft::SearchStats stats;
+    const auto found = index.search(&query, 3, ft::SearchOptions{}, &stats);
+    ASSERT_EQ(found.size(), 3);
+    EXPECT_EQ(found[0].id, 0);
+    EXPECT_EQ(found[1].id, 1);
+    EXPECT_EQ(found[2].id, 2);
+    EXPECT_EQ(storage.fast_factory_calls, 1);
+    EXPECT_EQ(storage.fast_scalar_calls, 1);
+    EXPECT_EQ(storage.fast_batch_calls, 2);
+    EXPECT_EQ(storage.vector_reads, 0);
+    EXPECT_EQ(stats.visited, 9);
+    EXPECT_EQ(stats.vector_reads, 9);
+    for (ft::NodeId id = 0; id < 9; ++id)
+        EXPECT_EQ(storage.fast_evaluations[id], 1);
+}
+
+TEST(TransactionalHNSWEdge, FastBackendBudgetPreservesPartialBatchResults) {
+    for (size_t budget : {1, 3, 5}) {
+        auto storage = star();
+        ft::HNSW index(storage);
+        ft::SearchOptions options;
+        options.max_visits = budget;
+        ft::SearchStats stats;
+        const float query = 8;
+        const auto found = index.search(&query, 9, options, &stats);
+        ASSERT_EQ(found.size(), budget);
+        EXPECT_EQ(stats.visited, budget);
+        EXPECT_EQ(stats.vector_reads, budget);
+        EXPECT_TRUE(stats.visit_limit_reached);
+        for (size_t i = 0; i < budget; ++i)
+            EXPECT_EQ(found[i].id, budget - 1 - i);
+        EXPECT_EQ(storage.fast_batch_calls, budget == 5 ? 1 : 0);
+        EXPECT_EQ(storage.vector_reads, 0);
+    }
+}
+
+TEST(TransactionalHNSWEdge,
+     FastBackendRejectsNonFiniteScalarAndBatchDistances) {
+    for (ft::NodeId bad_id : {0, 3}) {
+        auto storage = star();
+        storage.nonfinite_fast_id = bad_id;
+        ft::HNSW index(storage);
+        const float query = 0;
+        EXPECT_THROW(index.search(&query, 3), std::runtime_error);
+        EXPECT_EQ(storage.writes, 0);
+        EXPECT_FALSE(storage.invalidated);
+        if (bad_id)
+            EXPECT_EQ(storage.fast_batch_calls, 1);
+    }
+}
+
+TEST(TransactionalHNSWEdge, FastBackendInnerProductPreservesPublicScoreSign) {
+    auto storage = star();
+    storage.meta->config.metric = faiss::METRIC_INNER_PRODUCT;
+    ft::HNSW index(storage);
+    const float query = 2;
+    const auto accelerated = index.search(&query, 3);
+    storage.fast_queries = false;
+    const auto fallback = index.search(&query, 3);
+    ASSERT_EQ(accelerated.size(), 3);
+    ASSERT_EQ(fallback.size(), 3);
+    for (size_t i = 0; i < 3; ++i) {
+        EXPECT_EQ(accelerated[i].id, 8 - i);
+        EXPECT_FLOAT_EQ(accelerated[i].distance, 2 * (8 - i));
+        EXPECT_EQ(accelerated[i].id, fallback[i].id);
+        EXPECT_FLOAT_EQ(accelerated[i].distance, fallback[i].distance);
+    }
+    EXPECT_GE(storage.fast_batch_calls, 1);
+}
+
+TEST(TransactionalHNSWEdge, FastBackendCancellationDoesNotPublish) {
+    auto storage = star();
+    bool stop = false;
+    storage.after_fast_batch = [&] { stop = true; };
+    ft::HNSW index(storage);
+    ft::SearchOptions options;
+    options.cancelled = [&] { return stop; };
+    const float query = 0;
+    EXPECT_THROW(index.search(&query, 3, options), ft::SearchCancelled);
+    EXPECT_EQ(storage.fast_batch_calls, 1);
+    EXPECT_EQ(storage.writes, 0);
+    EXPECT_FALSE(storage.invalidated);
+}
+
+TEST(TransactionalHNSWEdge, FastBackendIsQueryOnlyAndSeesPendingUpdates) {
+    CountingStorage storage;
+    storage.fast_queries = true;
+    ft::HNSW index(storage);
+    index.create(configuration(1));
+    const float vectors[]{0, 1, 2, 3, 4, 5, 6, 7, 8};
+    index.add(9, vectors);
+    EXPECT_EQ(storage.fast_factory_calls, 0);
+    const float changed = 100;
+    EXPECT_EQ(index.update(1, &changed), 9);
+    EXPECT_EQ(storage.fast_factory_calls, 0);
+    const auto found = index.search(&changed, 3);
+    ASSERT_EQ(found.size(), 3);
+    EXPECT_EQ(found[0].id, 9);
+    EXPECT_FLOAT_EQ(found[0].distance, 0);
+    for (const auto& hit : found)
+        EXPECT_NE(hit.id, 1);
+    EXPECT_EQ(storage.fast_factory_calls, 1);
+}
+
+TEST(TransactionalHNSWEdge, FastLiveBackendCombinesTombstonesAndPredicate) {
+    auto storage = star();
+    storage.fast_live_queries = true;
+    storage.nodes[1].deleted = true;
+    storage.nodes[5].deleted = true;
+    storage.meta->live_count = 7;
+    ft::HNSW index(storage);
+    faiss::IDSelectorRange selected(2, 8);
+    const float query = 5;
+    const auto accelerated = index.search(&query, 8, 64, &selected);
+    ASSERT_EQ(accelerated.size(), 5);
+    EXPECT_EQ(storage.fast_live_reads_by_id[1], 0);
+    EXPECT_EQ(storage.fast_live_reads_by_id[8], 0);
+    EXPECT_GT(storage.fast_live_reads_by_id[5], 0);
+    storage.fast_live_queries = false;
+    const auto fallback = index.search(&query, 8, 64, &selected);
+    ASSERT_EQ(fallback.size(), accelerated.size());
+    for (size_t i = 0; i < accelerated.size(); ++i) {
+        EXPECT_EQ(accelerated[i].id, fallback[i].id);
+        EXPECT_FLOAT_EQ(accelerated[i].distance, fallback[i].distance);
+        EXPECT_GE(accelerated[i].id, 2);
+        EXPECT_LT(accelerated[i].id, 8);
+        EXPECT_NE(accelerated[i].id, 5);
+    }
+}
+
+TEST(TransactionalHNSWEdge, FastLiveBackendPreservesPartialVisitBudget) {
+    auto storage = star();
+    storage.fast_live_queries = true;
+    storage.nodes[1].deleted = true;
+    --storage.meta->live_count;
+    ft::HNSW index(storage);
+    ft::SearchOptions options;
+    options.max_visits = 5;
+    ft::SearchStats stats;
+    const float query = 8;
+    const auto found = index.search(&query, 8, options, &stats);
+    ASSERT_EQ(found.size(), 4);
+    EXPECT_EQ(found[0].id, 4);
+    EXPECT_EQ(found[1].id, 3);
+    EXPECT_EQ(found[2].id, 2);
+    EXPECT_EQ(found[3].id, 0);
+    EXPECT_EQ(stats.visited, 5);
+    EXPECT_TRUE(stats.visit_limit_reached);
+    EXPECT_GT(storage.fast_live_reads_by_id[1], 0);
+}
+
+TEST(TransactionalHNSWEdge, FastLiveBackendRetainsAcornTombstoneBridges) {
+    auto storage = chain(5);
+    storage.fast_queries = true;
+    storage.fast_live_queries = true;
+    storage.nodes[1].deleted = true;
+    storage.nodes[3].deleted = true;
+    storage.meta->live_count = 3;
+    ft::HNSW index(storage);
+    faiss::IDSelectorRange selected(0, 5);
+    ft::SearchOptions options;
+    options.acorn = true;
+    options.selector = &selected;
+    options.max_visits = 3;
+    ft::SearchStats stats;
+    const float query = 4;
+    const auto found = index.search(&query, 3, options, &stats);
+    ASSERT_EQ(found.size(), 3);
+    EXPECT_EQ(found[0].id, 4);
+    EXPECT_EQ(found[1].id, 2);
+    EXPECT_EQ(found[2].id, 0);
+    EXPECT_EQ(stats.visited, 3);
+    EXPECT_EQ(stats.expanded, 5);
+    EXPECT_EQ(storage.fast_evaluations[1], 0);
+    EXPECT_EQ(storage.fast_evaluations[3], 0);
+    EXPECT_GT(storage.fast_live_reads_by_id[1], 0);
+    EXPECT_GT(storage.fast_live_reads_by_id[3], 0);
+}
+
+TEST(TransactionalHNSWEdge,
+     ValidationRejectsBothLiveBackendMismatchDirections) {
+    for (const bool node_deleted : {false, true}) {
+        auto storage = chain(3);
+        storage.fast_queries = true;
+        storage.fast_live_queries = true;
+        storage.nodes[1].deleted = node_deleted;
+        storage.meta->live_count -= node_deleted;
+        ft::HNSW index(storage);
+        auto report = index.validate();
+        EXPECT_EQ(report.nodes, 3);
+        EXPECT_EQ(report.live_nodes, 3 - node_deleted);
+        storage.fast_live_overrides[1] = !node_deleted;
+        // This also tests the all-live metadata case: full validation must
+        // inspect live bits even when ordinary search can skip tombstones.
+        EXPECT_THROW(index.validate(), std::runtime_error);
+    }
+}
+
+TEST(TransactionalHNSWEdge, FastLiveBackendDoesNotRetainStateAcrossOperations) {
+    auto storage = star();
+    storage.fast_live_queries = true;
+    ft::HNSW index(storage);
+    const float query = 1;
+    ASSERT_EQ(index.search(&query, 1)[0].id, 1);
+    EXPECT_TRUE(index.erase(1));
+    ASSERT_EQ(index.search(&query, 1)[0].id, 0);
+    EXPECT_EQ(index.update(0, &query), 9);
+    const auto found = index.search(&query, 3);
+    ASSERT_EQ(found.size(), 3);
+    EXPECT_EQ(found[0].id, 9);
+    EXPECT_FLOAT_EQ(found[0].distance, 0);
+    for (const auto& hit : found) {
+        EXPECT_NE(hit.id, 0);
+        EXPECT_NE(hit.id, 1);
+    }
+    EXPECT_EQ(storage.fast_factory_calls, 3);
+}
+
+TEST(TransactionalHNSWEdge,
+     CollectorAvoidsPredicateAndLiveReadsForWorseCandidates) {
+    struct CountPredicate final : faiss::IDSelector {
+        mutable size_t calls = 0;
+        bool is_member(faiss::idx_t) const override {
+            ++calls;
+            return true;
+        }
+    } selected;
+    auto storage = star();
+    storage.fast_live_queries = true;
+    storage.nodes[8].deleted = true;
+    --storage.meta->live_count;
+    ft::HNSW index(storage);
+    const float query = 0;
+    const auto found = index.search(&query, 1, 64, &selected);
+    ASSERT_EQ(found.size(), 1);
+    EXPECT_EQ(found[0].id, 0);
+    EXPECT_EQ(selected.calls, 1);
+    EXPECT_EQ(storage.fast_live_reads, 1);
+    EXPECT_EQ(storage.fast_live_reads_by_id[0], 1);
 }
 } // namespace
