@@ -245,14 +245,17 @@ TEST_F(PackedStorage, CallbackWritesEachBlockOnceAndLogReplays) {
         EXPECT_FALSE(live->deleted(id));
 }
 
-TEST_F(PackedStorage, SavepointMapFullPreservesParentAndLeavesNoIndex) {
-    checked(mdb_env_set_mapsize(env, 512u << 10));
+TEST_F(PackedStorage, SavepointMapFullDuringNodeWritesPreservesParent) {
+    checked(mdb_env_set_mapsize(env, 256u << 10));
     {
         Transaction tx(env);
         raw_put(tx.txn, db, "graph", "prior mutation");
-        ft::LmdbStorage storage(tx.txn, db, 1, 0, {}, automatic, {true, 64});
+        ft::LmdbStorage storage(tx.txn, db, 1, 0, {}, automatic, {true, 4096});
         try {
-            storage.apply(batch(512, 1024));
+            // Three small vector blocks fit comfortably in 256 KiB. The
+            // 10,000 node keys cannot, so failure occurs after node writes
+            // have begun inside the savepoint rather than during vectors.
+            storage.apply(batch(10000, 1));
             FAIL() << "Expected map full";
         } catch (const ft::MutationError& error) {
             EXPECT_FALSE(error.abort_required());

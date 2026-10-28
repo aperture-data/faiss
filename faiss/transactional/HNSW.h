@@ -75,6 +75,7 @@ struct SearchStats;
 // Optional fast tombstone access implemented by a query distance computer.
 // It shares the computer's snapshot and operation-scoped lifetime. Invalid or
 // missing IDs must throw; the answer must agree with Storage::node(id).
+// deleted() must work before set_query(), including administrative validation.
 struct QueryLiveAccess {
     virtual ~QueryLiveAccess() = default;
     virtual bool deleted(NodeId id) const = 0;
