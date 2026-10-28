@@ -90,6 +90,11 @@ struct Storage {
     virtual std::optional<Metadata> metadata() const = 0;
     virtual Node node(NodeId id) const = 0;
     virtual std::vector<float> vector(NodeId id) const = 0;
+    // Administrative format checks beyond logical node/vector contents, e.g.
+    // packed block counts. Called only by HNSW::validate(), not by queries.
+    virtual void validate_storage(
+            const Metadata&,
+            const std::function<bool()>& /*cancelled*/) const {}
     // Optional operation-scoped fast query access. Distances are ascending:
     // squared L2 or NEGATIVE inner product. No writes, callback reentry, or
     // transaction end may occur while the computer exists. A null result uses

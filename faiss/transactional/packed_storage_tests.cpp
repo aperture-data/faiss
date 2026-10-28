@@ -590,4 +590,53 @@ TEST_F(PackedStorage, MapFullAfterNodeAndBitmapWritesRequiresCallerAbort) {
     ASSERT_NE(live, nullptr);
     EXPECT_FALSE(live->deleted(0));
 }
+
+TEST_F(PackedStorage, AdministrativeValidationChecksPhysicalBlockCounts) {
+    Transaction tx(env);
+    auto b = batch(4);
+    ft::LmdbStorage storage(tx.txn, db, 1, 0, {}, automatic, {true, 8});
+    storage.apply(b);
+    ft::HNSW index(storage);
+    EXPECT_EQ(index.validate().live_nodes, 4);
+    const auto original = raw_get(tx.txn, db, key('b'));
+    ASSERT_EQ(original.size(), 4096);
+    for (uint32_t count : {3u, 5u}) {
+        auto malformed = original;
+        set32(malformed, 8, count);
+        raw_put(tx.txn, db, key('b'), malformed);
+        // Minimum-size padding means the record's byte length stays valid;
+        // low-level vector reads still work for a populated slot.
+        EXPECT_EQ(storage.vector(0), b.vectors[0]);
+        EXPECT_THROW(index.validate(), std::runtime_error);
+    }
+    auto block_key = key('b');
+    MDB_val mk{block_key.size(), block_key.data()};
+    checked(mdb_del(tx.txn, db, &mk, nullptr));
+    EXPECT_THROW(index.validate(), std::runtime_error);
+    raw_put(tx.txn, db, key('b'), original);
+    const auto original_live = raw_get(tx.txn, db, key('l'));
+    auto malformed_live = original_live;
+    set32(malformed_live, 4, 5);
+    raw_put(tx.txn, db, key('l'), malformed_live);
+    EXPECT_THROW(index.validate(), std::runtime_error);
+    auto live_key = key('l');
+    mk = {live_key.size(), live_key.data()};
+    checked(mdb_del(tx.txn, db, &mk, nullptr));
+    EXPECT_THROW(index.validate(), std::runtime_error);
+    raw_put(tx.txn, db, key('l'), original_live);
+    EXPECT_EQ(index.validate().live_nodes, 4);
+}
+
+TEST_F(PackedStorage, PhysicalBlockValidationHonorsCancellation) {
+    Transaction tx(env);
+    auto b = batch(9);
+    ft::LmdbStorage storage(tx.txn, db, 1, 0, {}, automatic, {true, 2});
+    storage.apply(b);
+    int calls = 0;
+    EXPECT_THROW(
+            storage.validate_storage(b.metadata, [&] { return ++calls == 2; }),
+            ft::SearchCancelled);
+    EXPECT_EQ(calls, 2);
+    EXPECT_EQ(ft::HNSW(storage).validate().live_nodes, 9);
+}
 } // namespace

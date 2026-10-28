@@ -82,6 +82,9 @@ class LmdbStorage final : public Storage {
     std::optional<Metadata> metadata() const override;
     Node node(NodeId id) const override;
     std::vector<float> vector(NodeId id) const override;
+    // Low-level record writes do not preserve cross-record consistency.
+    // In particular, put_node does not maintain packed tombstone bitmaps.
+    // Use HNSW mutations or apply() for transactional graph changes.
     void put_metadata(const Metadata& value) override;
     void put_node(NodeId id, const Node& value) override;
     void put_vector(NodeId id, const std::vector<float>& value) override;
@@ -90,6 +93,10 @@ class LmdbStorage final : public Storage {
     // Any failure invalidates this adapter. MDB_WRITEMAP does not support
     // savepoints; explicitly select CallerTransaction for those environments.
     void apply(const WriteBatch& batch) override;
+    // Check every packed vector/live block against snapshot allocation bounds.
+    void validate_storage(
+            const Metadata& metadata,
+            const std::function<bool()>& cancelled) const override;
     // The returned computer borrows mapped block pointers for this operation.
     // The transaction and adapter must outlive it. No mutation (including
     // writes through another adapter or raw LMDB) may occur while it exists.

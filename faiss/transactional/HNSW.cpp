@@ -938,6 +938,8 @@ std::vector<Result> HNSW::search(
 ValidationReport HNSW::validate(const std::function<bool()>& cancel) const {
     cancelled(cancel);
     const auto meta = metadata();
+    storage_.validate_storage(meta, cancel);
+    cancelled(cancel);
     Overlay view(storage_, meta, 0, 8u << 20, cancel);
     const auto query_backend =
             storage_.query_distance_computer(meta, 1u << 20, nullptr);

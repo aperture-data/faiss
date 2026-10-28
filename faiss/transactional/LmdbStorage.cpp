@@ -789,6 +789,39 @@ class LmdbStorage::QueryDistanceComputer final : public faiss::DistanceComputer,
         finite(d3);
     }
 };
+void LmdbStorage::validate_storage(
+        const Metadata& metadata,
+        const std::function<bool()>& cancelled) const {
+    check();
+    const auto format = layout();
+    if (!format.width)
+        return;
+    if (!valid_metadata(metadata) ||
+        metadata.config.dimensions != format.dimensions)
+        throw std::runtime_error("Invalid HNSW packed validation metadata");
+    // Owned vector() intentionally accepts any populated slot. Administrative
+    // validation also requires the physical block boundaries to agree with
+    // the snapshot, exactly as the fast query computer requires.
+    for (uint64_t base = 0; base < metadata.next_id; base += format.width) {
+        if (cancelled && cancelled())
+            throw SearchCancelled();
+        const auto value =
+                block(static_cast<NodeId>(base / format.width), format);
+        const auto expected =
+                std::min<uint64_t>(format.width, metadata.next_id - base);
+        if (!value || value->count != expected)
+            throw std::runtime_error("Missing or incomplete HNSW packed block");
+    }
+    for (uint64_t base = 0; base < metadata.next_id; base += live_width) {
+        if (cancelled && cancelled())
+            throw SearchCancelled();
+        const auto value = live_block(static_cast<NodeId>(base / live_width));
+        const auto expected =
+                std::min<uint64_t>(live_width, metadata.next_id - base);
+        if (!value || value->count != expected)
+            throw std::runtime_error("Missing or incomplete HNSW live bitmap");
+    }
+}
 std::unique_ptr<faiss::DistanceComputer> LmdbStorage::query_distance_computer(
         const Metadata& metadata,
         size_t cache_bytes,
