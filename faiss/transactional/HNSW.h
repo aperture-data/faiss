@@ -132,7 +132,8 @@ struct MutationOptions {
     size_t max_workspace_bytes = 256u << 20;
     // Zero derives a finite ef/M/height bound. Exceeding it aborts this
     // operation before applying any records; traversal bookkeeping is O(this
-    // limit).
+    // limit). Counts query-to-candidate evaluations; symmetric neighbor
+    // diversification performs additional pairwise distances.
     size_t max_visits_per_insertion = 0;
     size_t cache_bytes = 8u << 20;
     // Must not mutate the transaction or reenter the index.

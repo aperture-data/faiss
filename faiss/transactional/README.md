@@ -87,6 +87,9 @@ inserts a replacement, returning a **new** ID; update the application mapping in
 the same transaction. Deleting an already deleted/unknown ID returns false.
 
 The default callback-free LMDB adapter applies each batch in a child transaction.
+This guarantee covers HNSW operations and `Storage::apply`; the adapter's low-level
+`put_*` methods write individual records and do not preserve graph consistency
+when called independently.
 A successful child commit only merges changes into the parent; nothing becomes
 visible to other readers until the caller commits the parent. Write failure
 aborts the child and invalidates the adapter. Catch `MutationError` and inspect
@@ -169,8 +172,9 @@ Batch flushes are not interrupted halfway by cancellation.
 ## Writes, capacity and retention
 
 `MutationOptions` bounds batch size (default 10,000 vectors), buffered dirty
-records (default 256 MiB), read caches (default 8 MiB), and distance evaluations
-per insertion (zero derives a finite construction bound). The workspace value
+records (default 256 MiB), read caches (default 8 MiB), and unique distances from
+each inserted vector to graph candidates (zero derives a finite construction
+bound). Neighbor diversification performs additional pairwise distances. The workspace value
 accounts for dirty payloads and estimated container overhead, not a strict
 process-RSS quota; traversal bookkeeping and bounded transient records are
 additional. Exceeding a preparation limit fails the entire operation before any

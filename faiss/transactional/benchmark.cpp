@@ -70,7 +70,7 @@ Options parse(int argc, char** argv) {
                        "  --ef 64 --m 32 --ef-construction 200 --seed 12345\n"
                        "  --metric l2|ip|cosine --selectivity 1 --churn 0\n"
                        "  --repeats 1 --warmup 16 --map-mib 0 (0=estimated)\n"
-                       "  --mode ann|acorn --max-visits 0 --cache-mib 8\n"
+                       "  --mode ann|acorn|exact --max-visits 0 --cache-mib 8\n"
                        "Churn replaces a fraction of initial vectors before queries.\n"
                        "Both engines retain old nodes as excluded traversal bridges.\n"
                        "Search measurements use one read snapshot, with warmup.\n";
@@ -127,7 +127,7 @@ Options parse(int argc, char** argv) {
         o.ef_construction < o.m || o.ef_construction > (1u << 24) ||
         !o.repeats ||
         (o.metric != "l2" && o.metric != "ip" && o.metric != "cosine") ||
-        (o.mode != "ann" && o.mode != "acorn"))
+        (o.mode != "ann" && o.mode != "acorn" && o.mode != "exact"))
         throw std::invalid_argument(
                 "invalid workload configuration; see --help");
     return o;
@@ -377,6 +377,7 @@ void run(const Options& o) {
     options.max_visits = o.max_visits;
     options.cache_bytes = multiply(o.cache_mib, 1u << 20);
     options.selector = params.sel;
+    options.exact = o.mode == "exact";
     std::vector<ft::NodeId> seeds;
     if (o.mode == "acorn") {
         options.selector = &selector;

@@ -1,0 +1,20 @@
+{
+  "engine_commit": "71af09b499d1fd1bb6d3420ca1457270a958df63",
+  "original_engine_commit": "36bd7dbcf38d5268f40902dd06392b4690007356",
+  "cpu": "Intel Core i7-11850H @ 2.50GHz; 8 cores, 16 threads",
+  "architecture": "x86_64",
+  "compiler": "g++ (Ubuntu 15.2.0-16ubuntu1) 15.2.0",
+  "cmake": "4.2.3",
+  "container": "aperturedata/aperturedb-developer:ci_develop-amd64",
+  "build": "Release -O3 -DNDEBUG, static libraries, generic FAISS kernels",
+  "omp_num_threads": 1,
+  "openblas_num_threads": 1,
+  "method": "100 single-query timings after 16 warmup queries, normal synthetic vectors, exact top-k ground truth. Engine execution order alternates per query. Each case rebuilds both indexes. No concurrent local build jobs during final query measurements.",
+  "comparison": "Native is ordinary FAISS IndexHNSWFlat with same M, efConstruction, efSearch, seed, metric, data. ACORN and exact are distinct algorithms; equal ef is not a matched-recall guarantee. ACORN uses 10 deterministic predicate-matching seeds.",
+  "limits": "Warm memory/cache, one process, one pass per case, 100 queries. No cold-cache, concurrent-writer, crash-recovery, production-data or million-vector qualification. Native retains tombstones via query selector for churn runs.",
+  "source_sha256": {
+    "faiss/transactional/HNSW.cpp": "89c9feed516373b1bfcccaa9a3a9038c71344cc9f4e9c54c539a4a8b66653c07",
+    "faiss/transactional/LmdbStorage.cpp": "f797825dcd514e676f59e375192f6f21dba54605535d57b1944fe77fec8904b7",
+    "faiss/transactional/benchmark.cpp": "996952bf851b9899515b280ba319b132d9d3f6e910dc97f6d25ce3a1896b6983"
+  }
+}

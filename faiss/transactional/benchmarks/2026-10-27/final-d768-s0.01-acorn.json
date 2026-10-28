@@ -1,0 +1,8 @@
+{
+  "workload":{"distribution":"normal","n":10000,"dimensions":768,"queries":100,"k":10,"batch":128,"m":32,"ef_construction":200,"ef_search":64,"max_visits":0,"cache_mib":8,"lmdb_mode":"acorn","seed":12345,"metric":"l2","selectivity":0.01,"allowed":99,"churn":0,"replaced":0,"warmup":16,"repeats":1,"omp_threads":1,"map_bytes":1073741824},
+  "build":{"lmdb_insert_and_erase_ms":69369.0992,"lmdb_commit_ms":424.326599,"native_insert_ms":7482.95878,"transactions":79,"max_writer_ms":1498.58137,"lmdb_file_bytes":49614848,"lmdb_high_water_pages":12113,"lmdb_page_bytes":4096},
+  "exact_search_total_ms":3.901205,
+  "lmdb":{"recall_at_k":0.995,"expected_neighbors":1000,"returned_neighbors":1000,"query_count":100,"mean_ms":4.86267132,"p50_ms":4.693571,"p95_ms":5.733251,"p99_ms":7.038584,"max_ms":7.211654,"queries_per_second":205.648281},
+  "native":{"recall_at_k":0.497,"expected_neighbors":1000,"returned_neighbors":1000,"query_count":100,"mean_ms":0.61747247,"p50_ms":0.563795,"p95_ms":1.022823,"p99_ms":1.184886,"max_ms":1.203286,"queries_per_second":1619.5054},
+  "lmdb_search_work":{"mean_distance_evaluations":154.86,"mean_expanded":2143.35,"mean_node_reads":2139.88,"mean_vector_reads":154.86,"budget_limited_queries":0}
+}
